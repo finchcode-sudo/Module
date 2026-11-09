@@ -178,7 +178,28 @@ public class MainHook extends XposedModule {
                             Object target = getField(self, "mTarget");
                             if (itemInfo != null && target instanceof Activity) {
                                 Activity act = (Activity) target;
-                                File apk = apkFileOf(act, itemInfo);
+                                final File apk = apkFileOf(act, itemInfo);
+                                if (apk != null && itemHasSplits(act, itemInfo)) {
+                                    // 拆分包应用要打 .apks，耗时较长，放子线程，避免卡住桌面主线程
+                                    final Activity actF = act;
+                                    toastMain(actF, "正在打包…");
+                                    new Thread(new Runnable() {
+                                        @Override public void run() {
+                                            final File out = renameForShare(actF, apk);
+                                            actF.runOnUiThread(new Runnable() {
+                                                @Override public void run() {
+                                                    if (out == null || out == apk) {
+                                                        toastMain(actF, "打包失败");
+                                                    } else {
+                                                        shareFiles(actF, new File[]{out});
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }, "lshare-apks").start();
+                                    log(android.util.Log.INFO, TAG, "AppShare handled by module (apks)");
+                                    return;
+                                }
                                 if (apk != null) {
                                     File renamed = renameForShare(act, apk);
                                     if (renamed != null && renamed != apk) {
@@ -199,6 +220,19 @@ public class MainHook extends XposedModule {
             log(android.util.Log.INFO, TAG, "hooked " + onClick);
         } catch (Throwable t) {
             log(android.util.Log.ERROR, TAG, "hookAppShareOnClick fail: " + t);
+        }
+    }
+
+    /** ItemInfo 对应的应用是否带拆分包 */
+    private static boolean itemHasSplits(Activity act, Object itemInfo) {
+        try {
+            Object comp = call(itemInfo, "getTargetComponent");
+            if (comp == null) return false;
+            String pkg = (String) call(comp, "getPackageName");
+            if (pkg == null) return false;
+            return hasSplits(act.getPackageManager().getApplicationInfo(pkg, 0));
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -249,7 +283,9 @@ public class MainHook extends XposedModule {
                 intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
                 intent.putExtra(Intent.EXTRA_STREAM, uris);
             }
-            intent.setType("application/vnd.android.package-archive");
+            boolean anyApks = false;
+            for (File f : files) if (f.getName().endsWith(".apks")) { anyApks = true; break; }
+            intent.setType(anyApks ? "*/*" : "application/vnd.android.package-archive");
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             int titleId = resId(act, "share_action", "string");
             String title = titleId != 0 ? act.getString(titleId) : "分享";
@@ -273,7 +309,7 @@ public class MainHook extends XposedModule {
         return null;
     }
 
-    /** 把 base.apk 改名为「应用名_版本名 (版本号).apk」副本，返回新文件；失败返回原文件 */
+    /** 把 base.apk 改名为「应用名_版本名 (版本号).apk」副本（带拆分包则打成 .apks），返回新文件；失败返回原文件 */
     private static File renameForShare(Activity act, File orig) {
         try {
             if (orig == null) return null;
@@ -290,17 +326,10 @@ public class MainHook extends XposedModule {
             if (pkg == null) { slog(android.util.Log.ERROR, TAG, "pkg not found for " + path); return orig; }
 
             android.content.pm.ApplicationInfo ai = act.getPackageManager().getApplicationInfo(pkg, 0);
-            String fileName = shareFileName(act, pkg, ai);
-
-            File pkgDir = new File(dir, safeName(pkg));
-            if (!pkgDir.exists()) pkgDir.mkdirs();
-            File dst = new File(pkgDir, fileName);
-            if (!dst.exists() || dst.length() != orig.length()) {
-                if (!copyFile(orig, dst)) { try { dst.delete(); } catch (Throwable ig) {} return orig; }
-            }
-            if (dst.exists() && dst.length() == orig.length()) {
-                slog(android.util.Log.INFO, TAG, "native share renamed -> " + fileName);
-                return dst;
+            File out = prepareShareFile(act, pkg, ai, dir);
+            if (out != null) {
+                slog(android.util.Log.INFO, TAG, "native share renamed -> " + out.getName());
+                return out;
             }
         } catch (Throwable t) {
             slog(android.util.Log.ERROR, TAG, "renameForShare fail: " + t);
@@ -595,7 +624,8 @@ public class MainHook extends XposedModule {
         }
         if (pkgs.isEmpty()) { toast(act, "所选项目不含应用"); return; }
 
-        // 子线程：复制 APK + 生成 URI（IO 重活）
+        // 子线程：复制 APK / 打包 .apks + 生成 URI（IO 重活）
+        final boolean[] hasApks = new boolean[1];
         new Thread(new Runnable() {
             @Override public void run() {
                 final ArrayList<Uri> uris = new ArrayList<Uri>();
@@ -626,23 +656,22 @@ public class MainHook extends XposedModule {
                         if (!src.exists() || !src.isFile()) continue;
 
                         File f = src;
+                        boolean split = hasSplits(ai);
                         try {
                             // 文件名格式与 Appkit 默认导出规则一致：应用名_版本名 (版本号).apk
-                            String fileName = shareFileName(act, pkg, ai);
-                            // 包名单独子目录，防同名不同包互相覆盖
-                            File pkgDir = new File(dir, safeName(pkg));
-                            if (!pkgDir.exists()) pkgDir.mkdirs();
-                            File dst = new File(pkgDir, fileName);
-                            if (!dst.exists() || dst.length() != src.length()) {
-                                if (!copyFile(src, dst)) {
-                                    // 复制失败就删掉残片，避免下次误用
-                                    try { dst.delete(); } catch (Throwable ig) {}
-                                }
+                            // 带拆分包的应用打成 .apks，否则对方装不上
+                            File got = prepareShareFile(act, pkg, ai, dir);
+                            if (got != null) {
+                                f = got;
+                                if (split) hasApks[0] = true;
+                            } else if (split) {
+                                log(android.util.Log.ERROR, TAG, "apks build fail, skip " + pkg);
+                                toastMain(act, "打包失败：" + pkg);
+                                continue;
                             }
-                            // 只有尺寸完全一致才用缓存副本，否则回退原 APK 路径
-                            if (dst.exists() && dst.length() == src.length()) f = dst;
                         } catch (Throwable t) {
                             log(android.util.Log.ERROR, TAG, "copy fail " + pkg + ": " + t);
+                            if (split) continue;
                         }
 
                         try {
@@ -669,7 +698,8 @@ public class MainHook extends XposedModule {
                                 intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
                                 intent.putExtra(Intent.EXTRA_STREAM, uris);
                             }
-                            intent.setType("application/vnd.android.package-archive");
+                            // 含 .apks 时不能用 apk 的 MIME，否则会被路由到系统安装器
+                            intent.setType(hasApks[0] ? "*/*" : "application/vnd.android.package-archive");
                             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                             int titleId = resId(act, "share_action", "string");
                             String title = titleId != 0 ? act.getString(titleId) : "分享";
@@ -740,6 +770,8 @@ public class MainHook extends XposedModule {
      * 分享文件名，与 Appkit 默认导出规则一致：「应用名_版本名 (版本号).apk」
      * （Appkit 模板 ?N_?V (?C)）。非法字符直接删除而不是替换成下划线，与 Appkit 一致。
      * 取不到版本名时退化为「应用名 (版本号).apk」。
+     * 带拆分包（splitSourceDirs 非空）的应用只分享 base.apk 会装不上（INSTALL_FAILED_MISSING_SPLIT），
+     * 所以这类应用打成 .apks（base.apk + 全部 split），扩展名为 .apks。
      */
     private static String shareFileName(Activity act, String pkg, android.content.pm.ApplicationInfo ai) {
         CharSequence label = null;
@@ -764,7 +796,7 @@ public class MainHook extends XposedModule {
         StringBuilder sb = new StringBuilder(appName);
         if (vn.length() > 0) sb.append('_').append(vn);
         if (vc > 0) sb.append(" (").append(vc).append(')');
-        return sb.append(".apk").toString();
+        return sb.append(hasSplits(ai) ? ".apks" : ".apk").toString();
     }
 
     /** 与 Appkit EnvironmentUtil.removeIllegalFileNameCharacters 一致：直接删除 ? \ / : * " < > | */
@@ -778,6 +810,86 @@ public class MainHook extends XposedModule {
             if (!bad) sb.append(c);
         }
         return sb.toString().trim();
+    }
+
+    /** 应用是否带拆分包 */
+    private static boolean hasSplits(android.content.pm.ApplicationInfo ai) {
+        return ai != null && ai.splitSourceDirs != null && ai.splitSourceDirs.length > 0;
+    }
+
+    /**
+     * 生成待分享文件（放在 dir/包名/ 下）：
+     * 无拆分包 → 复制 base.apk；有拆分包 → 打成 .apks。失败返回 null。
+     */
+    private static File prepareShareFile(Activity act, String pkg,
+                                         android.content.pm.ApplicationInfo ai, File dir) {
+        File src = new File(ai.sourceDir);
+        // 包名单独子目录，防同名不同包互相覆盖
+        File pkgDir = new File(dir, safeName(pkg));
+        if (!pkgDir.exists()) pkgDir.mkdirs();
+        File dst = new File(pkgDir, shareFileName(act, pkg, ai));
+        if (hasSplits(ai)) {
+            return buildApks(src, ai.splitSourceDirs, dst) ? dst : null;
+        }
+        if (!dst.exists() || dst.length() != src.length()) {
+            if (!copyFile(src, dst)) {
+                // 复制失败就删掉残片，避免下次误用
+                try { dst.delete(); } catch (Throwable ig) {}
+                return null;
+            }
+        }
+        // 只有尺寸完全一致才用缓存副本
+        return (dst.exists() && dst.length() == src.length()) ? dst : null;
+    }
+
+    /**
+     * 把 base.apk + 全部 split 打成 .apks（zip，根目录放 apk，与 Appkit 导出的 .apks 结构一致）。
+     * apk 本身已是压缩包，不再压缩（level 0），速度快。先写 .tmp 再改名，避免留下残缺文件；
+     * 目标文件比所有源文件都新时直接复用。
+     */
+    private static boolean buildApks(File base, String[] splits, File dst) {
+        File tmp = new File(dst.getPath() + ".tmp");
+        try {
+            long newest = base.lastModified();
+            for (String sp : splits) newest = Math.max(newest, new File(sp).lastModified());
+            if (dst.exists() && dst.length() > 0 && dst.lastModified() >= newest) return true;
+        } catch (Throwable ignored) {}
+
+        java.util.zip.ZipOutputStream zos = null;
+        try {
+            zos = new java.util.zip.ZipOutputStream(new java.io.BufferedOutputStream(
+                    new java.io.FileOutputStream(tmp), 65536));
+            zos.setLevel(0);
+            addZipEntry(zos, "base.apk", base);
+            for (String sp : splits) {
+                File f = new File(sp);
+                if (f.exists() && f.isFile()) addZipEntry(zos, f.getName(), f);
+            }
+            zos.close();
+            zos = null;
+            if (dst.exists()) dst.delete();
+            return tmp.renameTo(dst);
+        } catch (Throwable t) {
+            slog(android.util.Log.ERROR, TAG, "buildApks fail: " + t);
+            try { tmp.delete(); } catch (Throwable ig) {}
+            return false;
+        } finally {
+            if (zos != null) try { zos.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void addZipEntry(java.util.zip.ZipOutputStream zos, String name, File f) throws Exception {
+        zos.putNextEntry(new java.util.zip.ZipEntry(name));
+        java.io.FileInputStream in = null;
+        try {
+            in = new java.io.FileInputStream(f);
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = in.read(buf)) > 0) zos.write(buf, 0, n);
+        } finally {
+            if (in != null) try { in.close(); } catch (Throwable ignored) {}
+        }
+        zos.closeEntry();
     }
 
     /**
