@@ -309,7 +309,7 @@ public class MainHook extends XposedModule {
         return null;
     }
 
-    /** 把 base.apk 改名为「应用名_版本名 (版本号).apk」副本（带拆分包则打成 .apks），返回新文件；失败返回原文件 */
+    /** 把 base.apk 改名为「应用名_版本名 (版本号)_包名.apk」副本（带拆分包则打成 .apks），返回新文件；失败返回原文件 */
     private static File renameForShare(Activity act, File orig) {
         try {
             if (orig == null) return null;
@@ -658,7 +658,7 @@ public class MainHook extends XposedModule {
                         File f = src;
                         boolean split = hasSplits(ai);
                         try {
-                            // 文件名格式与 Appkit 默认导出规则一致：应用名_版本名 (版本号).apk
+                            // 文件名格式：应用名_版本名 (版本号)_包名.apk（末尾带包名，防止不同应用同名）
                             // 带拆分包的应用打成 .apks，否则对方装不上
                             File got = prepareShareFile(act, pkg, ai, dir);
                             if (got != null) {
@@ -766,10 +766,37 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /** 分享文件名的最大字节数 (UTF-8)。接收方 DroidFS 把文件名限制在 176 字节内，留点余量，避免包名被截掉 */
+    private static final int MAX_NAME_BYTES = 170;
+
+    private static int utf8Len(String s) {
+        try { return s.getBytes("UTF-8").length; } catch (Throwable t) { return s.length() * 3; }
+    }
+
+    /** 按 UTF-8 字节数截断，不会把一个字符截成两半 */
+    private static String truncateUtf8(String s, int maxBytes) {
+        if (maxBytes <= 0) return "";
+        if (utf8Len(s) <= maxBytes) return s;
+        StringBuilder sb = new StringBuilder();
+        int used = 0;
+        for (int i = 0; i < s.length(); ) {
+            int cp = s.codePointAt(i);
+            int n = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            if (used + n > maxBytes) break;
+            sb.appendCodePoint(cp);
+            used += n;
+            i += Character.charCount(cp);
+        }
+        return sb.toString();
+    }
+
     /**
-     * 分享文件名，与 Appkit 默认导出规则一致：「应用名_版本名 (版本号).apk」
-     * （Appkit 模板 ?N_?V (?C)）。非法字符直接删除而不是替换成下划线，与 Appkit 一致。
-     * 取不到版本名时退化为「应用名 (版本号).apk」。
+     * 分享文件名：「应用名_版本名 (版本号)_包名.apk」
+     * 末尾带上包名：应用名、版本名、版本号都相同但包名不同的两个应用（如同一软件的 foss / premium 版）
+     * 不会再生成同一个文件名，接收方（如 DroidFS）导入时不会撞名。
+     * 非法字符直接删除而不是替换成下划线（沿用 Appkit 的做法）。
+     * 取不到版本名时退化为「应用名 (版本号)_包名.apk」。
+     * 总长度超过 MAX_NAME_BYTES 时，保留版本号和包名，依次截短版本名、应用名。
      * 带拆分包（splitSourceDirs 非空）的应用只分享 base.apk 会装不上（INSTALL_FAILED_MISSING_SPLIT），
      * 所以这类应用打成 .apks（base.apk + 全部 split），扩展名为 .apks。
      */
@@ -793,10 +820,21 @@ public class MainHook extends XposedModule {
         }
         vn = vn == null ? "" : removeIllegal(vn);
 
-        StringBuilder sb = new StringBuilder(appName);
-        if (vn.length() > 0) sb.append('_').append(vn);
-        if (vc > 0) sb.append(" (").append(vc).append(')');
-        return sb.append(hasSplits(ai) ? ".apks" : ".apk").toString();
+        String ext = hasSplits(ai) ? ".apks" : ".apk";
+        String vcPart = vc > 0 ? " (" + vc + ")" : "";
+        String pkgName = removeIllegal(pkg);
+        String pkgPart = pkgName.length() > 0 ? "_" + pkgName : "";
+        String vnPart = vn.length() > 0 ? "_" + vn : "";
+
+        // 版本号、包名、扩展名必须完整保留；剩余字节预算分给版本名和应用名
+        int budget = MAX_NAME_BYTES - utf8Len(vcPart) - utf8Len(pkgPart) - utf8Len(ext);
+        if (budget < 16) budget = 16;
+        if (utf8Len(appName) + utf8Len(vnPart) > budget) {
+            vnPart = truncateUtf8(vnPart, budget / 2);
+            appName = truncateUtf8(appName, budget - utf8Len(vnPart)).trim();
+            if (appName.length() == 0) appName = "app";
+        }
+        return appName + vnPart + vcPart + pkgPart + ext;
     }
 
     /** 与 Appkit EnvironmentUtil.removeIllegalFileNameCharacters 一致：直接删除 ? \ / : * " < > | */
